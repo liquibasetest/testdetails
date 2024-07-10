@@ -1,125 +1,43 @@
-CREATE OR REPLACE PROCEDURE CREATE_MASKING_POLICIES()
-  RETURNS STRING
-  LANGUAGE JAVASCRIPT
-  EXECUTE AS CALLER
-AS
-$$
-var v_policy_name, v_data_type, v_function_name, v_sql, v_table_name, v_field_name, v_db_name, v_schema_name, dropPolicySQL;
+import os
+import boto3
+import subprocess
 
-// Drop the existing policy from all associated columns
-dropPolicySQL = `SELECT A.FIELD, B.DBNAME, B.SCHEMANAME, B.TABLENAME, B.SNOWFLAKEPOLICYNAME
-    FROM COLUMN_TO_LOB_PG_MAP A, NATIVE_ROLE_AD_MAPPING B
-    WHERE A.TABLENAME = B.TABLENAME
-      AND A.DATATYPE = B.DATATYPE
-      AND A.PROTECTIONGROUP = B.PROTECTIONGROUP`;
+s3_client = boto3.client('s3')
 
-var dropPolicyStatement = snowflake.createStatement({sqlText: dropPolicySQL});
-var dropPolicyResultSet = dropPolicyStatement.execute();
+# Set variables
+s3_bucket = 'your-bucket'
+liquibase_jar_key = 'liquibase/liquibase.jar'
+jdbc_jar_key = 'liquibase/snowflake-jdbc.jar'
+changelog_key = 'liquibase/changelog.xml'
 
-while (dropPolicyResultSet.next()) {
-  v_field_name = dropPolicyResultSet.getColumnValue("FIELD");
-  v_db_name = dropPolicyResultSet.getColumnValue("DBNAME");
-  v_schema_name = dropPolicyResultSet.getColumnValue("SCHEMANAME");
-  v_table_name = dropPolicyResultSet.getColumnValue("TABLENAME");
-  v_existing_policy_name = dropPolicyResultSet.getColumnValue("SNOWFLAKEPOLICYNAME");
+# Local paths to download files
+liquibase_jar_local_path = '/tmp/liquibase.jar'
+jdbc_jar_local_path = '/tmp/snowflake-jdbc.jar'
+changelog_local_path = '/tmp/changelog.xml'
 
-  // Drop the existing masking policy from the column
-  var dropPolicyFromColumnSQL = 
-    'ALTER TABLE ' + v_db_name + '.' + v_schema_name + '.' + v_table_name +
-    ' MODIFY COLUMN ' + v_field_name + ' UNSET MASKING POLICY;';
+# Download files from S3 to local /tmp directory
+s3_client.download_file(s3_bucket, liquibase_jar_key, liquibase_jar_local_path)
+s3_client.download_file(s3_bucket, jdbc_jar_key, jdbc_jar_local_path)
+s3_client.download_file(s3_bucket, changelog_key, changelog_local_path)
 
-  try {
-    // Try executing the SQL statement
-    snowflake.execute({sqlText: dropPolicyFromColumnSQL});
-  } catch (e) {
-    // If an error occurs, log the details to the function_result table
-    var logErrorSQL = "INSERT INTO function_result (action, field_name, db_name, schema_name, table_name, error_message) " +
-                      "VALUES (?, ?, ?, ?, ?, ?)";
-    var logErrorStatement = snowflake.createStatement({sqlText: logErrorSQL, binds: ["Drop Policy", v_field_name, v_db_name, v_schema_name, v_table_name, e.toString()]});
-    logErrorStatement.execute();
-    continue; // Continue with the next iteration
-  }
-}
+# Set environment variables
+os.environ['LIQUIBASE_HOME'] = '/tmp'
+os.environ['CLASSPATH'] = f"/tmp:{jdbc_jar_local_path}"
 
-// Temporary table to store created policies
-var createTempTableSQL = "CREATE TEMPORARY TABLE IF NOT EXISTS temp_created_policies (policy_name STRING)";
-snowflake.execute({sqlText: createTempTableSQL});
+# Prepare Liquibase command
+liquibase_command = [
+    'java', '-jar', liquibase_jar_local_path,
+    '--changeLogFile=' + changelog_local_path,
+    '--url=jdbc:snowflake://youraccount.region.snowflakecomputing.com',
+    '--driver=net.snowflake.client.jdbc.SnowflakeDriver',
+    '--classpath=' + jdbc_jar_local_path,
+    '--accessToken=' + 'your-oauth-token',  # Replace with your actual token
+    'update'
+]
 
-// Loop through the NATIVE_ROLE_AD_MAPPING table
-var mappingResultSet = snowflake.execute({sqlText: "SELECT * FROM NATIVE_ROLE_AD_MAPPING"});
-while (mappingResultSet.next()) {
-  v_policy_name = mappingResultSet.getColumnValue("SNOWFLAKEPOLICYNAME");
-
-  // Check if the policy has already been created
-  var policyCheckSQL = "SELECT * FROM temp_created_policies WHERE policy_name = ?";
-  var policyCheckStatement = snowflake.createStatement({sqlText: policyCheckSQL, binds: [v_policy_name]});
-  var policyCheckResultSet = policyCheckStatement.execute();
-  if (!policyCheckResultSet.next()) {
-    v_data_type = mappingResultSet.getColumnValue("DATATYPE");
-    v_function_name = mappingResultSet.getColumnValue("FUNCTIONNAME") + '()';
-    v_table_name = mappingResultSet.getColumnValue("TABLENAME");
-    v_db_name = mappingResultSet.getColumnValue("DBNAME");
-    v_schema_name = mappingResultSet.getColumnValue("SCHEMANAME");
-
-    // Dynamic SQL to create the masking policy
-    v_sql = `
-      CREATE OR REPLACE MASKING POLICY ${v_policy_name}
-      AS (val ${v_data_type}) 
-      RETURNS ${v_data_type} ->  
-      CASE WHEN ${v_function_name} THEN val ELSE NULL END;`;
-
-    try {
-      // Try executing the SQL statement
-      snowflake.execute({sqlText: v_sql});
-    } catch (e) {
-      // If an error occurs, log the details to the function_result table
-      var logErrorSQL = "INSERT INTO function_result (action, policy_name, db_name, schema_name, table_name, error_message) " +
-                        "VALUES (?, ?, ?, ?, ?, ?)";
-      var logErrorStatement = snowflake.createStatement({sqlText: logErrorSQL, binds: ["Create Policy", v_policy_name, v_db_name, v_schema_name, v_table_name, e.toString()]});
-      logErrorStatement.execute();
-      continue; // Continue with the next iteration
-    }
-  }
-
-  // Loop through the COLUMN_TO_LOB_PG_MAP and NATIVE_ROLE_AD_MAPPING tables
-  var applyPolicySQL = `
-    SELECT A.FIELD, B.DBNAME, B.SCHEMANAME, B.TABLENAME
-    FROM COLUMN_TO_LOB_PG_MAP A, NATIVE_ROLE_AD_MAPPING B
-    WHERE A.TABLENAME = B.TABLENAME
-      AND A.DATATYPE = B.DATATYPE
-      AND A.PROTECTIONGROUP = B.PROTECTIONGROUP
-      AND B.SNOWFLAKEPOLICYNAME = ?`;
-
-  var applyPolicyStatement = snowflake.createStatement({sqlText: applyPolicySQL, binds: [v_policy_name]});
-  var applyPolicyResultSet = applyPolicyStatement.execute();
-
-  while (applyPolicyResultSet.next()) {
-    v_field_name = applyPolicyResultSet.getColumnValue("FIELD");
-    v_db_name = applyPolicyResultSet.getColumnValue("DBNAME");
-    v_schema_name = applyPolicyResultSet.getColumnValue("SCHEMANAME");
-    v_table_name = applyPolicyResultSet.getColumnValue("TABLENAME");
-
-    // Apply the masking policy to the field
-    var alterTableSQL = `ALTER TABLE ${v_db_name}.${v_schema_name}.${v_table_name} 
-      MODIFY COLUMN ${v_field_name} SET MASKING POLICY ${v_policy_name}`;
-
-    try {
-      // Try executing the SQL statement
-      snowflake.execute({sqlText: alterTableSQL});
-    } catch (e) {
-      // If an error occurs, log the details to the function_result table
-      var logErrorSQL = "INSERT INTO function_result (action, field_name, db_name, schema_name, table_name, error_message) " +
-                        "VALUES (?, ?, ?, ?, ?, ?)";
-      var logErrorStatement = snowflake.createStatement({sqlText: logErrorSQL, binds: ["Apply Policy", v_field_name, v_db_name, v_schema_name, v_table_name, e.toString()]});
-      logErrorStatement.execute();
-      continue; // Continue with the next iteration
-    }
-  }
-}
-
-// Drop the temporary table
-var dropTempTableSQL = "DROP TABLE IF EXISTS temp_created_policies";
-snowflake.execute({sqlText: dropTempTableSQL});
-
-return 'Masking policies created and applied successfully';
-$$;
+# Run Liquibase command
+try:
+    result = subprocess.run(liquibase_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print(result.stdout.decode('utf-8'))
+except subprocess.CalledProcessError as e:
+    print(e.stderr.decode('utf-8'))
